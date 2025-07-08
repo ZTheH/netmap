@@ -12,8 +12,9 @@ A comprehensive network security scanner with improved features:
 - Single host detailed scanning
 - Network range scanning with CIDR support
 - Professional reporting and JSON export
+- Background CVE database updates
 
-Author: Enhanced version
+Author: ZTheH
 """
 
 import socket
@@ -28,12 +29,14 @@ import signal
 import sys
 import re
 import os
+import requests
 from typing import List, Dict, Set, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 
-# Configure logging
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -79,6 +82,7 @@ class NetworkScanner:
         self.results: List[ScanResult] = []
         self.vulnerability_db = self._load_vulnerability_database()
         self.vendor_db = self._load_vendor_database()
+        self.background_update_thread = None
         
         # Set up signal handler for Ctrl+C (only if in main thread)
         try:
@@ -87,6 +91,9 @@ class NetworkScanner:
             # Signal handler can only be registered from main thread
             # This is expected when called from GUI or other threads
             logger.info("Signal handler not registered (not in main thread)")
+        
+        # Start background CVE update (15 seconds after initialization)
+        self._schedule_background_update()
         
         # Common ports to scan
         self.common_ports = [
@@ -142,6 +149,136 @@ class NetworkScanner:
             logger.debug(f"Could not load enhanced CVE database: {e}")
         
         # Fallback to comprehensive built-in database
+        logger.info("Using comprehensive built-in CVE database")
+        return self._get_builtin_enhanced_database()
+    
+    def _load_vendor_database(self) -> Dict[str, str]:
+        """Load MAC address vendor database."""
+        return {
+            "00:01:02": "3Com", "00:01:03": "3Com", "00:02:A5": "3Com",
+            "00:03:47": "Intel", "00:04:AC": "Intel", "00:07:E9": "Intel",
+            "00:08:02": "Hewlett-Packard", "00:08:74": "Dell", "00:0A:27": "Apple",
+            "00:0B:DB": "Dell", "00:0C:29": "VMware", "00:0D:87": "Cisco",
+            "00:0E:58": "Cisco", "00:10:18": "Broadcom", "00:11:43": "Dell",
+            "00:12:3F": "Apple", "00:13:72": "Dell", "00:14:22": "Dell",
+            "00:15:5D": "Microsoft", "00:16:CB": "Apple", "00:17:A4": "Dell",
+            "00:18:8B": "Dell", "00:19:99": "Apple", "00:1A:A0": "Dell",
+            "00:1B:21": "Dell", "00:1C:42": "Dell", "00:1D:7E": "Apple",
+            "00:1E:52": "Apple", "00:1F:5B": "Apple", "00:20:91": "VIA",
+            "00:21:70": "Dell", "00:22:19": "Apple", "00:23:32": "Apple",
+            "00:24:36": "Apple", "00:25:00": "Apple", "00:25:4B": "Apple",
+            "00:26:08": "Apple", "00:26:BB": "Apple", "00:27:15": "Lenovo",
+            "00:50:56": "VMware", "00:A0:C9": "Intel", "00:B0:D0": "Dell",
+            "00:C0:B7": "American Megatrends", "00:D0:B7": "Intel",
+            "00:E0:81": "Tyan Computer", "08:00:27": "Oracle VirtualBox",
+            "50:65:F3": "Cisco", "52:54:00": "QEMU/KVM", "54:52:00": "Realtec",
+            "68:05:CA": "Cisco", "70:B3:D5": "IEEE", "78:2B:CB": "Apple",
+            "8C:DC:D4": "Apple", "A0:36:9F": "Apple", "A4:5E:60": "Apple",
+            "AC:BC:32": "Apple", "B8:E8:56": "Apple", "C8:2A:14": "Apple",
+            "DC:A6:32": "Apple", "E0:AC:CB": "Apple", "E4:CE:8F": "Apple",
+            "F0:18:98": "Apple", "F4:37:B7": "Apple", "F8:1E:DF": "Apple"
+        }
+    
+    def _schedule_background_update(self):
+        """Schedule background CVE database update."""
+        def delayed_update():
+            time.sleep(15)  # Wait 15 seconds after startup
+            self._background_update_cve_database()
+        
+        self.background_update_thread = threading.Thread(target=delayed_update, daemon=True)
+        self.background_update_thread.start()
+        logger.debug("Background CVE update scheduled for 15 seconds after startup")
+    
+    def _should_update_database(self) -> bool:
+        """Check if CVE database needs updating based on file age."""
+        try:
+            if os.path.exists('enhanced_cve_database.json'):
+                file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime('enhanced_cve_database.json'))
+                return file_age > timedelta(days=7)  # Update if older than 7 days
+            return True  # Update if file doesn't exist
+        except Exception as e:
+            logger.debug(f"Error checking database age: {e}")
+            return True
+    
+    def _fetch_recent_cves(self) -> Dict[str, List[str]]:
+        """Fetch recent CVEs from CIRCL API with minimal API calls."""
+        try:
+            logger.info("Fetching recent CVEs in background...")
+            url = "https://cve.circl.lu/api/last"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                recent_cves = response.json()
+                
+                # Process and categorize recent CVEs
+                enhanced_db = {}
+                if isinstance(recent_cves, list):
+                    enhanced_db['Recent_Critical'] = []
+                    for cve in recent_cves[:20]:  # Limit to 20 most recent
+                        if isinstance(cve, dict) and 'id' in cve:
+                            cve_id = cve['id']
+                            summary = cve.get('summary', 'Recent vulnerability')[:80]
+                            if len(summary) == 80:
+                                summary += "..."
+                            enhanced_db['Recent_Critical'].append(f"{cve_id} ({summary})")
+                
+                logger.info(f"Background update: Fetched {len(enhanced_db.get('Recent_Critical', []))} recent CVEs")
+                return enhanced_db
+            else:
+                logger.debug(f"API returned status code: {response.status_code}")
+                
+        except requests.RequestException as e:
+            logger.debug(f"Network error during background update: {e}")
+        except Exception as e:
+            logger.debug(f"Error during background CVE fetch: {e}")
+        
+        return {}
+    
+    def _background_update_cve_database(self):
+        """Update CVE database in background without blocking scanner."""
+        try:
+            if not self._should_update_database():
+                logger.debug("CVE database is recent, skipping background update")
+                return
+            
+            logger.info("Starting background CVE database update...")
+            
+            # Fetch recent CVEs with minimal API calls
+            recent_cves = self._fetch_recent_cves()
+            
+            if recent_cves:
+                # Load existing database
+                existing_db = self._get_builtin_enhanced_database()
+                
+                # Merge recent CVEs with existing database
+                for service, vulns in recent_cves.items():
+                    if service in existing_db:
+                        # Add new CVEs to existing service
+                        existing_db[service].extend(vulns)
+                    else:
+                        # Add new service category
+                        existing_db[service] = vulns
+                
+                # Save updated database
+                try:
+                    with open('enhanced_cve_database.json', 'w') as f:
+                        json.dump(existing_db, f, indent=2)
+                    
+                    # Update the in-memory database
+                    self.vulnerability_db = existing_db
+                    
+                    logger.info("Background CVE database update completed successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to save updated CVE database: {e}")
+            else:
+                logger.debug("No new CVEs fetched, using existing database")
+                
+        except Exception as e:
+            logger.error(f"Background CVE update failed: {e}")
+    
+    def _get_builtin_enhanced_database(self) -> Dict[str, List[str]]:
+        """Get comprehensive built-in vulnerability database."""
         return {
             "Apache/2.2": [
                 "CVE-2009-3555 (SSL/TLS Renegotiation DoS - Critical)",
@@ -341,33 +478,6 @@ class NetworkScanner:
                 "Banner grabbing may reveal version information",
                 "Check for default credentials"
             ]
-        }
-    
-    def _load_vendor_database(self) -> Dict[str, str]:
-        """Load MAC address vendor database."""
-        return {
-            "00:01:02": "3Com", "00:01:03": "3Com", "00:02:A5": "3Com",
-            "00:03:47": "Intel", "00:04:AC": "Intel", "00:07:E9": "Intel",
-            "00:08:02": "Hewlett-Packard", "00:08:74": "Dell", "00:0A:27": "Apple",
-            "00:0B:DB": "Dell", "00:0C:29": "VMware", "00:0D:87": "Cisco",
-            "00:0E:58": "Cisco", "00:10:18": "Broadcom", "00:11:43": "Dell",
-            "00:12:3F": "Apple", "00:13:72": "Dell", "00:14:22": "Dell",
-            "00:15:5D": "Microsoft", "00:16:CB": "Apple", "00:17:A4": "Dell",
-            "00:18:8B": "Dell", "00:19:99": "Apple", "00:1A:A0": "Dell",
-            "00:1B:21": "Dell", "00:1C:42": "Dell", "00:1D:7E": "Apple",
-            "00:1E:52": "Apple", "00:1F:5B": "Apple", "00:20:91": "VIA",
-            "00:21:70": "Dell", "00:22:19": "Apple", "00:23:32": "Apple",
-            "00:24:36": "Apple", "00:25:00": "Apple", "00:25:4B": "Apple",
-            "00:26:08": "Apple", "00:26:BB": "Apple", "00:27:15": "Lenovo",
-            "00:50:56": "VMware", "00:A0:C9": "Intel", "00:B0:D0": "Dell",
-            "00:C0:B7": "American Megatrends", "00:D0:B7": "Intel",
-            "00:E0:81": "Tyan Computer", "08:00:27": "Oracle VirtualBox",
-            "50:65:F3": "Cisco", "52:54:00": "QEMU/KVM", "54:52:00": "Realtec",
-            "68:05:CA": "Cisco", "70:B3:D5": "IEEE", "78:2B:CB": "Apple",
-            "8C:DC:D4": "Apple", "A0:36:9F": "Apple", "A4:5E:60": "Apple",
-            "AC:BC:32": "Apple", "B8:E8:56": "Apple", "C8:2A:14": "Apple",
-            "DC:A6:32": "Apple", "E0:AC:CB": "Apple", "E4:CE:8F": "Apple",
-            "F0:18:98": "Apple", "F4:37:B7": "Apple", "F8:1E:DF": "Apple"
         }
     
     @contextmanager
@@ -1130,6 +1240,7 @@ def main():
     print("=" * 50)
     print("Advanced network reconnaissance and security assessment tool")
     print("Features: Host discovery, port scanning, service detection, vulnerability assessment")
+    print("🔄 Background CVE database updates enabled (auto-refresh every 7 days)")
     print()
     
     scanner = NetworkScanner()
